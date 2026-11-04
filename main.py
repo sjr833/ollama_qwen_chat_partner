@@ -1,20 +1,21 @@
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import StreamingResponse, JSONResponse
 from pydantic import BaseModel, Field
+
 import aiohttp
 import json
 import asyncio
 import time
 import uvicorn
+
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 from sqlalchemy.orm import DeclarativeBase, sessionmaker
 from sqlalchemy import Column, Integer, String, Float, Text
 
 
-app = FastAPI()     #创建fastapi实例
 
 
-# 每个session_id独立异步锁（过期/清空不删除锁，锁复用）
+# 每个session_id独立异步锁（过期/清空不删除锁，锁复用），用来隔离同一个会话（session_id）的并发请求
 session_locks = {}
 
 # 记录每个session最后活跃时间戳（TTL用）
@@ -23,45 +24,37 @@ session_last_active: dict[str, float] = {}
 # 记录每个session上次请求时间戳（限流用）
 session_last_request: dict[str, float] = {}
 
-# 全局元锁：保护上面两个字典并发读写
+# 全局元锁：保护上面两个字典并发读写，保证同一时刻只有一个协程在读写它们
 GLOBAL_META_LOCK = asyncio.Lock()
 
-ALLOWED_MODELS = ["qwen2.5:7b"]  # 允许使用的模型白名单
+ALLOWED_MODELS = ["qwen2.5:7b","deepseek-r1:8b"]  # 允许使用的模型白名单
 
-# 配置
+# 会话清理相关配置
 SESSION_TTL = 30 * 60       # 会话30分钟闲置过期
 CLEAN_INTERVAL = 60         # 每60秒扫描一次过期会话
 RATE_LIMIT_SECONDS = 3      # 同一session两次请求最小间隔（秒）
 
 
 # ========== SQLAlchemy 异步MySQL配置 ==========
-# 建表
-## 创建异步引擎
-DB_URL = "mysql+aiomysql://hello_qwen:123456@localhost:3306/ollama_qwen_chat_partner_messages?charset=utf8"
+DB_URL = "mysql+aiomysql://hello_qwen:123456@localhost:3306/ollama_qwen_chat_partner_messages?charset=utf8" # SQLAlchemy 异步MySQL连接字符串
+# 创建异步引擎 + 初始化连接池   整个服务运行期间一直存在除非手动关闭
 async_engine = create_async_engine(
     DB_URL,
     echo=False,   # echo=True 打印SQL，调试打开，上线关掉
-    pool_pre_ping=True,  # 自动检测断开重连，MySQL很重要
+    pool_pre_ping=True,  # 自动检测断开重连，MySQL很重要，如果一条连接空闲太久，一直没发SQL，MySQL 会主动把这条连接断开、扔掉。
+                         # 但是！SQLAlchemy 的连接池自己不知道这件事。池子里面还存着这条连接，标记它是“可用”的。
+                         # pool_pre_ping=True = 每次拿连接先验活，提前干掉池子里已经被MySQL单方面踢掉的“僵尸连接”
     pool_size=10,  # 设置连接池活跃的连接数量
     max_overflow=20  # 允许额外的连接数
 )
 
-## 定义模型类:基类+表对应的模型类
-### 基类，所有ORM模型继承它
+# 基类，所有ORM模型继承它
 class Base(DeclarativeBase):
     pass
 
-### 异步会话工厂
-AsyncSessionLocal = sessionmaker(
-    bind=async_engine,  #绑定数据库引擎
-    class_=AsyncSession,    #指定会话类
-    expire_on_commit=False  #提交后会话不过期，不会重新查询数据库
-)
-
 # ========== ORM 消息模型 ==========
 class Message(Base):
-    __tablename__ = "messages"
-
+    __tablename__ = "messages"  # 表名
     id = Column(Integer, primary_key=True, autoincrement=True)
     session_id = Column(String(100), nullable=False, index=True) # 加索引，按session查询快
     role = Column(String(32), nullable=False)
@@ -69,39 +62,46 @@ class Message(Base):
     create_time = Column(Float, nullable=False)
 
 
-
-
-class StreamReq(BaseModel):
-    # 参数约束
-    prompt: str = Field(..., min_length=1, max_length=4096, description="用户提问内容")
-    model: str = Field(default="qwen2.5:7b", description="Ollama模型名")
-    temperature: float = Field(default=0.7, ge=0.0, le=2.0, description="温度，0~2之间")
-    system: str | None = Field(default=None, max_length=2048, description="系统提示词")
-    session_id: str = Field(..., min_length=1, max_length=100, description="会话ID")
-
-
 # ========== 数据库相关函数 ==========
 async def init_db():
     # 自动建表；已经手动建表的话，这个只是幂等，不会重复创建
-    async with async_engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
+    async with async_engine.begin() as conn:    # 开启一个事务并拿到一个数据库连接对象（临时）
+        await conn.run_sync(Base.metadata.create_all)   # 建表
+                                                        # Base.metadata.create_all 是同步函数，SQLAlchemy原生建表方法没有async版本
+                                                        # Base.metadata收集了所有继承Base的ORM模型
+                                                        # .create_all：去MySQL查一遍，不存在的表才创建
+
+# 异步会话工厂，sessionmaker()是SQLAlchemy提供的工厂函数，返回一个定制好的会话类
+AsyncSessionLocal = sessionmaker(
+    bind=async_engine,  #绑定数据库引擎
+    class_=AsyncSession,    #指定为异步会话类
+    expire_on_commit=False  #提交后会话不过期，不会重新查询数据库
+)
+""" 代码解释
+    msg = await db.get(Message, 1)
+    print(msg.content)
+    
+    msg.content = "新的聊天内容"
+    await db.commit()
+    
+    # ✨commit之后，msg对象【不过期】，内存里还保留刚才修改后的值
+    print(msg.content)
+    # 直接读内存里存好的值！！【不会再去数据库查询】
+"""
 
 
-
-async def load_messages_from_db(session_id: str) -> list[dict]:
+async def load_messages_from_db(session_id: str) -> list[dict]: # 返回值类型注解
     """读取某个会话全部历史消息，按id升序"""
-    async with AsyncSessionLocal() as db:
+    async with AsyncSessionLocal() as db:   # 调用AsyncSessionLocal会话工厂 生成一个异步会话实例 db
         # select 筛选，按id正序
         res = await db.execute(
-            Message.__table__.select()
+            Message.__table__.select()      # Message.__table__:拿到ORM模型对应的底层表对象
             .where(Message.session_id == session_id)
             .order_by(Message.id.asc())
         )
-        rows = res.all()
+        rows = res.all()   # 把查询到的所有行取出来
         # 转成代码兼容的dict格式
         return [{"role": row.role, "content": row.content} for row in rows]
-
-
 
 async def insert_message_to_db(session_id: str, role: str, content: str):
     """插入一条消息，返回自增id"""
@@ -114,10 +114,8 @@ async def insert_message_to_db(session_id: str, role: str, content: str):
         )
         db.add(new_msg)
         await db.commit()
-        await db.refresh(new_msg) # 刷新，拿到数据库生成的id
+        await db.refresh(new_msg) # 刷新，拿到数据库生成的id。去数据库查询这条刚插入的数据，把数据库里生成的自增id，同步刷新到内存的 new_msg 对象上。
         return new_msg.id
-
-
 
 async def delete_message_by_id(msg_id: int):
     """根据id单条删除消息"""
@@ -126,9 +124,6 @@ async def delete_message_by_id(msg_id: int):
         if msg:
             await db.delete(msg)
             await db.commit()
-
-
-
 
 async def delete_session_messages(session_id: str):
     """删除一个session下全部消息（/clear和过期清理用）"""
@@ -151,18 +146,14 @@ async def clean_expire_session():
                 if now - session_last_active[sid] > SESSION_TTL:
                     expired_sids.append(sid)
         if expired_sids:
-            # 循环调用ORM删除函数，替换原来sqlite原生sql
             for sid in expired_sids:
                 await delete_session_messages(sid)
             # 清理内存字典
             for sid in expired_sids:
-                session_last_active.pop(sid, None)
+                session_last_active.pop(sid, None)  # 写了None：如果sid不存在不会报错
                 session_last_request.pop(sid, None)
 
-@app.on_event("startup")
-async def startup():
-    await init_db()
-    asyncio.create_task(clean_expire_session())
+
 
 
 # ========== 流式对话生成器 ==========
@@ -233,6 +224,21 @@ async def stream_generator(prompt: str, model: str, temp: float | int, system: s
             yield f"data: [服务器错误] {str(e)}\n\n"
 
 
+app = FastAPI()     #创建fastapi实例
+
+class StreamReq(BaseModel):
+    # 参数约束
+    prompt: str = Field(..., min_length=1, max_length=4096, description="用户提问内容")
+    model: str = Field(default="qwen2.5:7b", description="Ollama模型名")
+    temperature: float = Field(default=0.7, ge=0.0, le=2.0, description="温度，0~2之间")
+    system: str | None = Field(default=None, max_length=2048, description="系统提示词")
+    session_id: str = Field(..., min_length=1, max_length=100, description="会话ID")
+
+@app.on_event("startup")
+async def startup():
+    await init_db()
+    asyncio.create_task(clean_expire_session())
+
 @app.post("/chat_stream")
 async def chat_stream(req: StreamReq):
     # 模型白名单校验
@@ -257,7 +263,6 @@ async def chat_stream(req: StreamReq):
                                              # text/event-stream长连接，服务端可以多次不断推送消息，前端持续吸收
     )
 
-
 @app.post("/clear")
 async def clear_context(session_id: str):
     if session_id not in session_locks:
@@ -269,6 +274,8 @@ async def clear_context(session_id: str):
             session_last_active[session_id] = time.time()
         await delete_session_messages(session_id)
     return {"msg": f"会话 {session_id} 上下文已经清空"}
+
+
 
 
 if __name__ == "__main__":
