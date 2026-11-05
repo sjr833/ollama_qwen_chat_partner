@@ -12,9 +12,9 @@
 - **多会话隔离**：每个 `session_id` 一把独立异步锁，同一会话串行、不同会话并行
 - **历史持久化**：消息存 MySQL（SQLAlchemy 2.0 异步 ORM），重启不丢上下文
 - **上下文自动过期**：会话闲置 30 分钟自动清理（后台协程每 60 秒扫描）
-- **请求限流**：同一 `session_id` 两次请求至少间隔 3 秒，超限返回 429
+- **请求限流**：同一 `session_id` 两次请求至少间隔 3 秒，超限返回 429（Redis 原子 `SET NX EX`）
 - **模型白名单**：只允许 `ALLOWED_MODELS` 中的模型，防止调用未下载/未授权模型
-- **失败回滚**：Ollama 报错、连接中断或服务异常时，自动删除刚落库的 user 消息，保证历史干净
+- **失败回滚**：Ollama 返回错误、连不上 Ollama 或流中抛异常时，自动删除刚落库的 user 消息，保证历史干净
 
 ---
 
@@ -29,6 +29,7 @@
 | SQLAlchemy 2.0 | 异步 ORM（`create_async_engine` + `AsyncSession`） |
 | aiomysql | MySQL 异步驱动 |
 | MySQL 8 | 会话消息存储 |
+| Redis | 请求限流（`SET NX EX` 原子操作；3.x 以上均可，代码显式使用 RESP2 协议） |
 
 Python 版本要求 **3.10+**（代码使用了 `str | None` 语法）。
 
@@ -38,13 +39,19 @@ Python 版本要求 **3.10+**（代码使用了 `str | None` 语法）。
 
 ```
 ollama_qwen_chat_partner/
-├── main.py          # 全部服务代码：ORM 模型、数据库操作、流式对话、路由
+├── main.py            # FastAPI 主逻辑：应用实例、请求模型、路由、启动/关闭生命周期
+├── chat.py            # 对话业务：SSE 帧编码 + 流式调用 Ollama 并落库
+├── database.py        # 数据层：MySQL（ORM 模型 + 增删查）与 Redis（限流 key）都在这里
+├── session_locks.py   # 会话级异步锁 + 保护锁字典的全局元锁
+├── config.py          # 全局配置：MySQL/Redis/Ollama 连接参数、TTL、限流、历史条数、模型白名单
+├── requirements.txt   # 依赖清单（pip install -r requirements.txt）
 ├── README.md
 ├── LICENSE
 └── .gitignore
 ```
 
-单文件项目，`main.py` 内部分为四块：**配置常量 → ORM 模型/引擎 → 数据库操作函数 → 路由与业务逻辑**。
+分层原则：`main.py` 只保留 FastAPI 相关的东西（路由、请求模型、生命周期），业务与存储细节下沉；
+`database.py` 是唯一碰 MySQL 引擎和 Redis 客户端的文件，其他模块只调用它暴露的函数。
 
 ---
 
@@ -78,21 +85,35 @@ FLUSH PRIVILEGES;
 
 > 表不用手动建，服务启动时会执行 `Base.metadata.create_all` 自动建表（幂等）。
 
-### 3. 安装依赖
+### 3. 准备 Redis
+
+限流用 Redis 的 `SET NX EX` 做原子占位，默认连 `127.0.0.1:6379` 的 `db=0`、无密码：
 
 ```bash
-pip install fastapi uvicorn aiohttp sqlalchemy aiomysql cryptography pydantic
+redis-server            # Windows 下也可直接用 phpstudy 自带的 Redis
+redis-cli ping          # 期望返回 PONG
+```
+
+> Redis 是必需依赖：限流只走 Redis，不做进程内兜底，Redis 不可用时请求会直接报错。
+> 多进程/多实例部署同样依赖 Redis 共享限流状态，各进程才能统一计数。
+
+### 4. 安装依赖
+
+```bash
+pip install -r requirements.txt
+# 或者手动装：
+pip install fastapi uvicorn aiohttp sqlalchemy aiomysql cryptography pydantic redis
 ```
 
 `cryptography` 必须有：MySQL 8 默认使用 `caching_sha2_password` 认证，缺了它会报
 `RuntimeError: 'cryptography' package is required`。
 
-### 4. 配置数据库连接
+### 5. 配置数据库连接
 
-修改 `main.py` 中的 `DB_URL`：
+修改 `config.py` 中的 `DB_URL`：
 
 ```python
-DB_URL = "mysql+aiomysql://hello_qwen:123456@localhost:3306/ollama_qwen_chat_partner_messages?charset=utf8"
+DB_URL = "mysql+aiomysql://hello_qwen:123456@localhost:3306/ollama_qwen_chat_partner_messages?charset=utf8mb4"
 ```
 
 格式：`mysql+aiomysql://用户名:密码@主机:端口/库名?charset=utf8mb4`
@@ -100,7 +121,7 @@ DB_URL = "mysql+aiomysql://hello_qwen:123456@localhost:3306/ollama_qwen_chat_par
 > ⚠️ 当前账号密码是硬编码的，推公开仓库前建议改为读环境变量，例如
 > `os.getenv("DB_URL", "mysql+aiomysql://...")`，账号密码不要进版本库。
 
-### 5. 启动服务
+### 6. 启动服务
 
 ```bash
 python main.py
@@ -142,7 +163,7 @@ curl -N -X POST http://127.0.0.1:8000/chat_stream \
       }'
 ```
 
-响应为 SSE 流，每个分片是一段增量文本：
+响应为 SSE 流，每个 `data:` 帧是一段增量文本，最后以 `data: [DONE]` 结束：
 
 ```
 data: 闭包
@@ -150,9 +171,15 @@ data: 闭包
 data: 是指
 
 data: 函数与其
+
+data: [DONE]
 ```
 
-前端消费（浏览器）：
+> 文本里的换行会拆成多条 `data:` 行放在同一个事件里（`data: 第一行\ndata: 第二行\n\n`），
+> 客户端把同一事件的 data 行用 `\n` 拼起来即可还原原始换行。这是 SSE 规范要求的转义方式，
+> 直接把带换行的文本塞进一个 `data:` 会丢换行。
+
+前端消费（浏览器，按 SSE 规范解析事件）：
 
 ```javascript
 const resp = await fetch("http://127.0.0.1:8000/chat_stream", {
@@ -162,15 +189,31 @@ const resp = await fetch("http://127.0.0.1:8000/chat_stream", {
 });
 const reader = resp.body.getReader();
 const decoder = new TextDecoder();
+let buf = "";
 
 while (true) {
   const { done, value } = await reader.read();
   if (done) break;
-  const chunk = decoder.decode(value, { stream: true });
-  for (const line of chunk.split("\n")) {
-    if (line.startsWith("data: ")) {
-      document.body.append(line.slice(6));   // 逐字追加
+  buf += decoder.decode(value, { stream: true });
+
+  // SSE 以空行分隔事件，缓冲到完整的空行再处理，避免把半截帧切坏
+  let idx;
+  while ((idx = buf.indexOf("\n\n")) !== -1) {
+    const block = buf.slice(0, idx);
+    buf = buf.slice(idx + 2);
+
+    const text = block
+      .split("\n")
+      .filter((l) => l.startsWith("data: "))
+      .map((l) => l.slice(6))
+      .join("\n");           // 同一事件的多行 data 用换行拼回
+
+    if (text === "[DONE]") return;        // 流正常结束
+    if (/^\[(Ollama错误|连接失败|服务异常)/.test(text)) {  // 流内错误
+      console.error(text);
+      return;
     }
+    document.body.append(text);           // 逐字追加
   }
 }
 ```
@@ -250,20 +293,21 @@ CREATE TABLE messages (
 
 ### TTL 清理
 
-后台协程每 60 秒扫一遍 `session_last_active`，超过 30 分钟未活跃的 `session_id` 会被删除消息记录，并清空内存里的两个字典。检查与删除分两段执行（先收集、后删除），避免长时间持锁阻塞请求。
+后台协程每 60 秒扫一遍 `session_meta.last_active_at`，超过 30 分钟未活跃的 `session_id` 会被删除消息记录，并从 `session_locks` 里移除对应的锁。检查与删除分两段执行（先收集、后删除），避免长时间持锁阻塞请求。
 
 ---
 
 ## 可配置项
 
-`main.py` 顶部常量：
+`config.py` 顶部常量（`async_engine` 的 `echo` 在 `database.py`）：
 
 | 常量 | 默认值 | 说明 |
 |---|---|---|
-| `ALLOWED_MODELS` | `["qwen2.5:7b"]` | 模型白名单，需与 `ollama list` 一致 |
+| `ALLOWED_MODELS` | `["qwen2.5:7b", "deepseek-r1:8b"]` | 模型白名单，需与 `ollama list` 一致 |
 | `SESSION_TTL` | `30 * 60` | 会话闲置过期时间（秒） |
 | `CLEAN_INTERVAL` | `60` | 过期扫描周期（秒） |
 | `RATE_LIMIT_SECONDS` | `3` | 同会话最小请求间隔（秒） |
+| `MAX_HISTORY_MESSAGES` | `20` | 每次送给模型的历史消息条数上限（只取最近 N 条，防止超上下文） |
 | `DB_URL` | `mysql+aiomysql://...` | 数据库连接串 |
 | `async_engine(echo=)` | `False` | 改 `True` 可打印所有 SQL，调试用 |
 
@@ -294,6 +338,23 @@ MySQL 没启动，或端口不是 3306。先用 `mysql -u hello_qwen -p` 手工�
 
 **Q：上下文突然消失**
 闲置超过 30 分钟被 TTL 清理了，或调过 `/clear`。两者都会删库记录且不可恢复。
+
+**Q：启动或请求时报 `redis.exceptions.ResponseError: unknown command 'HELLO'`**
+Redis 服务端版本低于 6.0（例如 phpstudy 自带的 3.0.504），不支持 `HELLO` 命令，
+而 redis-py 8.x 默认走 RESP3 握手会先发 `HELLO`。代码里已显式指定 `protocol=2`（RESP2），
+如果你自己新建了 Redis 客户端，记得同样加上 `protocol=2`，或把服务端升级到 6.0+。
+
+**Q：请求时报 Redis 连接错误**
+限流只走 Redis，不做进程内兜底，Redis 不可用时 `/chat_stream` 会返回 500。
+确认 Redis 已启动、地址端口是 `127.0.0.1:6379` 即可。
+
+**Q：客户端中途断开（关页面、点停止生成），历史里会留下"只有问没有答"的记录吗**
+会。当前没有做断连补存：连接断开后 Starlette 会取消流式生成器，已经生成的内容不会落库，
+刚插入的 user 消息也会原样保留。需要时再补这块逻辑。
+
+**Q：历史太长的老会话，模型好像"忘了"早期内容**
+`MAX_HISTORY_MESSAGES = 20` 只把最近 20 条消息送给模型，更早的仍在库里但不再参与推理，
+这是为了避免超过模型上下文窗口。需要更长记忆就调大该值，或后续接摘要/RAG。
 
 ---
 
