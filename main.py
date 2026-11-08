@@ -37,6 +37,7 @@ async def startup():
     await init_db()
     # 启动过期清理任务
     _clean_task = asyncio.create_task(clean_expire_session())   # 保存任务引用，shutdown 时才能取消
+    # 这里不能直接写await clean_expire_session(),因为这个函数只有在服务结束时才会结束，这样写会原地堵住,等任务结束
 
 @app.on_event("shutdown")
 async def shutdown():

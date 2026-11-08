@@ -181,9 +181,11 @@ async def clean_expire_session():
                 expired_sids = res.scalars().all()
             if expired_sids:
                 for sid in expired_sids:
-                    await delete_session_messages(sid)
-                # 顺手把 session_locks 里对应的条目也删掉（函数内部加锁，见 session_locks.py）
-                drop_session_locks(expired_sids)
+                    lock=await get_session_lock(sid)    # 先获取对应的锁
+                    async with lock:
+                        await delete_session_messages(sid)  # 删掉聊天记录和活跃信息
+                # 顺手把 session_locks 里对应的条目也删掉
+                await drop_session_locks(expired_sids)
                 print("清理过期会话: ",expired_sids)
         except Exception as e:
             print("清理任务异常: ",e)
@@ -192,7 +194,7 @@ async def clean_expire_session():
 # ========== 整会话清理（/clear 用） ==========
 async def reset_session(session_id: str):
     """清空一个会话：消息 + 会话状态 + 限流 key"""
-    lock = get_session_lock(session_id)
+    lock =await get_session_lock(session_id)
     async with lock:    # 防止同一个会话同时读写和删除数据库信息
         await delete_session_messages(session_id)
         await clear_rate_limit(session_id)

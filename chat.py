@@ -19,7 +19,7 @@ def sse_frame(text: str) -> str:
 
 # ========== 流式对话生成器 ==========
 async def stream_generator(prompt: str, model: str, temp: float | int, system: str | None, session_id: str):
-    lock = get_session_lock(session_id)
+    lock =await get_session_lock(session_id)    # 异步函数调用后返回协程对象，await的作用是跑完这个协程拿到return出来的值
     async with lock:
         # 加载历史上下文
         messages = await load_messages_from_db(session_id)
