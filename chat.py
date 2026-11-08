@@ -11,20 +11,14 @@ from session_locks import get_session_lock
 
 
 # 把一段文本包装成合法的 SSE 帧
-# 原实现是 yield f"data: {token}\n\n"，一旦 token 里带换行（模型几乎每条回答都有），
-# 实际发出的是 "data: 第一行\n第二行\n\n"：第二行没有 data: 前缀，按 SSE 规范会被丢弃，
-# 前端看到的换行就全没了；极端情况下还会把一帧拆成两帧。
-# 这里按行拆开、每行都加 data: 前缀，客户端用 "\n" 拼接 data 行即可还原原始换行。
 def sse_frame(text: str) -> str:
-    text = text.replace("\r\n", "\n").replace("\r", "\n")
-    return "".join(f"data: {line}\n" for line in text.split("\n")) + "\n"
+    text = text.replace("\r\n", "\n").replace("\r", "\n")       # 统一所有换行符为\n
+    return "".join(f"data: {line}\n" for line in text.split("\n")) + "\n"   # 按行拆分成列表，循环加data前缀，拼接，最后补上一个换行
+            # 分隔符.join(可迭代对象): 用分隔符把可迭代对象里所有元素拼在一起，返回新的字符串
 
 
 # ========== 流式对话生成器 ==========
 async def stream_generator(prompt: str, model: str, temp: float | int, system: str | None, session_id: str):
-    # [修改] 整个回合（读历史 -> 调模型 -> 落库）都放进该会话的锁里：
-    #        同一会话的多个请求串行执行，不同会话之间各用各的锁、互不影响。
-    #        这是原注释里“隔离同一个会话的并发请求”真正落地的地方。
     lock = get_session_lock(session_id)
     async with lock:
         # 加载历史上下文
@@ -57,12 +51,12 @@ async def stream_generator(prompt: str, model: str, temp: float | int, system: s
                             continue
                         buffer += chunk
                         while b"\n" in buffer:
-                            line, buffer = buffer.split(b"\n", 1)
-                            line = line.strip(b"\r\n")
+                            line, buffer = buffer.split(b"\n", 1)   # 切割一次
+                            line = line.strip(b"\r\n")  # 把一行两头多余的换行，回车空白去掉
                             if not line:
                                 continue
                             line_str = line.decode("utf-8")
-                            data = json.loads(line_str)
+                            data = json.loads(line_str)     # 转字典
                             # 流中途 Ollama 也可能返回 {"error": "..."}，
                             # 原来直接取 data["message"]["content"] 会 KeyError，
                             # 用户只会看到一句没用的 [服务异常] KeyError: 'message'

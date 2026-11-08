@@ -132,7 +132,7 @@ async def update_session_active(session_id: str):
     async with AsyncSessionLocal() as db:
         stmt = (
             mysql_insert(SessionMeta)
-            .values(session_id=session_id, last_active_at=now, create_time=now)
+            .values(session_id=session_id, last_active_at=now, create_time=now) # 没有重复主键时插入，反之更新
             .on_duplicate_key_update(last_active_at=now)   # 命中主键就只刷新活跃时间，create_time 保持不变
         )
         await db.execute(stmt)
@@ -176,11 +176,6 @@ async def clean_expire_session():
         try:
             async with AsyncSessionLocal() as db:
                 # 查询所有过期的session_id
-                # [修改] 原来写的是 now - SessionMeta.last_active_at > SESSION_TTL，
-                #        列参与了减法运算，MySQL 用不上 idx_last_active 索引
-                #        （EXPLAIN 显示 possible_keys=NULL、type=index，等于每次全索引扫描）。
-                #        改成把常量先算好、列单独放一边的 last_active_at < now - SESSION_TTL，
-                #        变成范围条件，EXPLAIN 显示 type=range 走索引。
                 stmt=select(SessionMeta.session_id).where(SessionMeta.last_active_at < now - SESSION_TTL)
                 res=await db.execute(stmt)
                 expired_sids = res.scalars().all()

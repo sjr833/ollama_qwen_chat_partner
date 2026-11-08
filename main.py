@@ -43,11 +43,11 @@ async def shutdown():
     # 关闭过期清理任务
     global _clean_task
     if _clean_task:
-        _clean_task.cancel()
+        _clean_task.cancel()    # 发一个取消信号，不会立刻杀死任务
         try:
-            await _clean_task
+            await _clean_task   # 等待任务执行完毕，完成退出|任务被取消时会抛异常，必须捕获
         except asyncio.CancelledError:
-            pass
+            pass                # 捕获并吃掉异常
         _clean_task = None
     # 关闭MySQL连接池
     await dispose_db()
