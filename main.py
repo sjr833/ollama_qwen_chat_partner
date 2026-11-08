@@ -10,8 +10,7 @@ from pydantic import BaseModel, Field
 
 from chat import stream_generator
 from config import ALLOWED_MODELS, RATE_LIMIT_SECONDS
-from database import (check_rate_limit, clean_expire_session, close_redis, dispose_db, init_db,
-                      init_redis, reset_session)
+from database import (check_rate_limit, clean_expire_session, close_redis, dispose_db, init_db,init_redis, reset_session)
 
 #  后台清理任务的引用：shutdown 时要能取消它，否则退出时会打印 Task was destroyed but it is pending
 _clean_task: asyncio.Task|None = None
@@ -34,6 +33,7 @@ async def startup():
     # 连接redis
     await init_redis()
     # 建表
+
     await init_db()
     # 启动过期清理任务
     _clean_task = asyncio.create_task(clean_expire_session())   # 保存任务引用，shutdown 时才能取消

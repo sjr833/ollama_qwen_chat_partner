@@ -1,6 +1,27 @@
-fastapi>=0.110
-uvicorn>=0.27
-pydantic>=2.5
+# Python 3.10+（代码用了 str | None 语法）
+# 安装：pip install -r requirements.txt
+
+# Web 框架与 ASGI 服务器（main.py 直接 import uvicorn）
+fastapi>=0.110,<1.0
+uvicorn[standard]>=0.27
+pydantic>=2.5,<3.0
+
+# 调用 Ollama 流式接口 /api/chat（返回 NDJSON，逐行解析）
 aiohttp>=3.9
-SQLAlchemy>=2.0
+
+# MySQL：异步 ORM + 异步驱动
+# [asyncio] 会一并装 greenlet，AsyncSession 依赖它
+SQLAlchemy[asyncio]>=2.0
+
+# 代码里没有 import aiomysql，是 DB_URL 的 mysql+aiomysql 让 SQLAlchemy 去加载
+# 它依赖 PyMySQL（>=1.0），会自动装上
+aiomysql>=0.2
+
+# 账号用 caching_sha2_password / sha256_password 认证时必需（做 RSA 密码加密）
+# PyMySQL 只在 [rsa] extra 里带它，所以显式列出；本地的 mysql_native_password 账号并不需要
+# 缺了会报 RuntimeError: 'cryptography' package is required
+cryptography>=41
+
+# Redis：请求限流（SET NX EX）
+# redis.asyncio 自 redis 4.2 起内置；8.x 默认走 RESP3，连接时先发 HELLO，因此服务端需 6.0+
 redis>=5.0

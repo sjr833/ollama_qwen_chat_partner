@@ -12,7 +12,7 @@ from sqlalchemy.orm import DeclarativeBase
 
 from config import (CLEAN_INTERVAL, DB_URL, MAX_HISTORY_MESSAGES, RATE_LIMIT_SECONDS,
                     REDIS_DB, REDIS_HOST, REDIS_PORT, SESSION_TTL)
-from session_locks import GLOBAL_META_LOCK, drop_session_locks, get_session_lock
+from session_locks import drop_session_locks, get_session_lock
 
 
 # ========== SQLAlchemy 异步MySQL配置 ==========
@@ -118,7 +118,7 @@ async def delete_message_by_id(msg_id: int):
 
 async def delete_session_messages(session_id: str):
     async with AsyncSessionLocal() as db:
-        # ✅ 直接语句批量删除
+        # 直接语句批量删除
         stmt_msg = delete(Message).where(Message.session_id == session_id)
         await db.execute(stmt_msg)
         stmt_meta = delete(SessionMeta).where(SessionMeta.session_id == session_id)
@@ -183,7 +183,7 @@ async def clean_expire_session():
                 for sid in expired_sids:
                     await delete_session_messages(sid)
                 # 顺手把 session_locks 里对应的条目也删掉（函数内部加锁，见 session_locks.py）
-                await drop_session_locks(expired_sids)
+                drop_session_locks(expired_sids)
                 print("清理过期会话: ",expired_sids)
         except Exception as e:
             print("清理任务异常: ",e)
@@ -193,7 +193,6 @@ async def clean_expire_session():
 async def reset_session(session_id: str):
     """清空一个会话：消息 + 会话状态 + 限流 key"""
     lock = get_session_lock(session_id)
-    async with lock:        # 防止同一个会话同时读写和删除全局变量
-        async with GLOBAL_META_LOCK:   # 防止不同会话同时读写
-            await delete_session_messages(session_id)
-            await clear_rate_limit(session_id)
+    async with lock:    # 防止同一个会话同时读写和删除数据库信息
+        await delete_session_messages(session_id)
+        await clear_rate_limit(session_id)
