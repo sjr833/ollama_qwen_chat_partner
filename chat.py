@@ -1,5 +1,6 @@
-"""对话业务：SSE 帧编码 + 流式调用 Ollama 并落库
-只负责“一轮问答怎么跑”，不涉及 FastAPI 路由和生命周期
+"""
+    对话业务：SSE 帧编码 + 流式调用 Ollama 并落库
+    只负责“一轮问答怎么跑”，不涉及 FastAPI 路由和生命周期
 """
 import aiohttp
 import json

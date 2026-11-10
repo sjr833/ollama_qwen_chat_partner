@@ -1,5 +1,6 @@
-"""FastAPI 主逻辑：应用实例、请求模型、路由、启动/关闭生命周期
-具体的数据存取看 database.py，对话业务流程看 chat.py，可调参数看 config.py
+"""
+    FastAPI 主逻辑：应用实例、请求模型、路由、启动/关闭生命周期
+    具体的数据存取看 database.py，对话业务流程看 chat.py，可调参数看 config.py
 """
 import asyncio
 
@@ -33,7 +34,6 @@ async def startup():
     # 连接redis
     await init_redis()
     # 建表
-
     await init_db()
     # 启动过期清理任务
     _clean_task = asyncio.create_task(clean_expire_session())   # 保存任务引用，shutdown 时才能取消
@@ -59,21 +59,22 @@ async def shutdown():
 async def chat_stream(req: StreamReq):
     # 模型白名单校验
     if req.model not in ALLOWED_MODELS:
-        raise HTTPException(status_code=400, detail=f"不支持的模型，可选：{ALLOWED_MODELS}")
-
+        return JSONResponse(status_code=400, content={"detail":f"不支持的模型，可选：{ALLOWED_MODELS}"})
     # 限流校验：同一session两次请求最小间隔（超限返回429）
-    ok = await check_rate_limit(req.session_id)
+    ok = await check_rate_limit(req.session_id,"rate_limit:chat")
     if not ok:
         return JSONResponse(status_code=429, content={"detail": f"请求过于频繁，请等待{RATE_LIMIT_SECONDS:.1f}秒后再试"})
-
-    return StreamingResponse(
-        stream_generator(req.prompt, req.model, req.temperature, req.system, req.session_id),
-        media_type="text/event-stream"       # application/json一次性返回全部数据
-                                             # text/event-stream长连接，服务端可以多次不断推送消息，前端持续吸收
-    )
+    return (StreamingResponse
+        (stream_generator(req.prompt, req.model, req.temperature, req.system, req.session_id),
+        media_type="text/event-stream"))
+                                        # application/json一次性返回全部数据
+                                        # text/event-stream长连接，服务端可以多次不断推送消息，前端持续吸收
 
 @app.post("/clear")
 async def clear_context(session_id: str):
+    ok = await check_rate_limit(session_id, "rate_limit:clear")
+    if not ok:
+        return JSONResponse(status_code=429, content={"detail": f"请求过于频繁，请等待{RATE_LIMIT_SECONDS:.1f}秒后再试"})
     # 清空消息、会话状态、限流 key 都在 reset_session 里做（内部按会话加锁）
     await reset_session(session_id)
     return {"msg": f"会话 {session_id} 上下文已经清空"}

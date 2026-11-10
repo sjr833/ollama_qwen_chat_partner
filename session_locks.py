@@ -1,5 +1,4 @@
 import asyncio
-import threading
 
 # 每个session_id独立异步锁，用来隔离同一个会话（session_id）的并发请求；会话过期清理时一并移除
 session_locks = {}
